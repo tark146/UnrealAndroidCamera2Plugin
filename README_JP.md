@@ -126,9 +126,43 @@ USimpleCamera2Test::StopCameraPreview();
 - 処理: カメラ操作用バックグラウンドスレッド
 - テクスチャ更新: ゲームスレッド同期
 
+### 解像度の変更方法
+
+デフォルト解像度は800x600ですが、他のサポートされた解像度に変更できます。**重要**: メモリ破損を避けるため、3箇所すべてを一貫して更新する必要があります。
+
+**サポートされている解像度（Quest 3）:**
+- 320x240
+- 640x480
+- 800x600（デフォルト）
+- 1280x960
+
+**必要な変更:**
+
+1. **Java側** - `Source/AndroidCamera2Plugin/Android/src/com/epicgames/ue4/Camera2Helper.java`を編集:
+```java
+private int frameWidth = 800;   // ここを変更
+private int frameHeight = 600;  // ここを変更
+```
+
+2. **C++側（テクスチャ作成）** - `Source/AndroidCamera2Plugin/Private/SimpleCamera2Test.cpp`を編集:
+```cpp
+CameraTexture = UTexture2D::CreateTransient(800, 600, PF_B8G8R8A8);
+```
+
+3. **C++側（メモリ初期化）** - 同じファイルの数行下:
+```cpp
+FMemory::Memset(TextureData, 64, 800 * 600 * 4); // 幅 * 高さ * 4(RGBA)
+```
+
+**変更後:**
+1. ビルドフォルダをクリーン: プラグインとプロジェクト両方の`Intermediate`と`Binaries`フォルダを削除
+2. プロジェクトファイルを再生成
+3. プロジェクトをリビルド
+
+⚠️ **警告**: この3つの値が一致しないと、メモリアクセス違反やテクスチャ破損が発生します。
+
 ### 現在の制限事項（v1.0）
 - **色精度の問題** - フルカラーYUVからRGB変換は実装済みですが、暖色系/オレンジがかった色合いになる場合があります
-- **固定解像度** - 320x240ピクセル（ハードコード、変更にはコード修正が必要）
 - **色空間キャリブレーション必要** - Quest 3カメラは特定の色空間を使用しており微調整が必要
 - これらは初期リリースの一時的な制限です
 

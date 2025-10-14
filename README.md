@@ -126,9 +126,43 @@ The plugin automatically adds the following permissions to your Android manifest
 - Processing: Background thread for camera operations
 - Texture update: Game thread synchronized
 
+### Changing Resolution
+
+The default resolution is 800x600, but you can change it to other supported resolutions. **Important**: You must update ALL THREE locations consistently to avoid memory corruption.
+
+**Supported Resolutions (Quest 3):**
+- 320x240
+- 640x480
+- 800x600 (default)
+- 1280x960
+
+**Required Changes:**
+
+1. **Java Side** - Edit `Source/AndroidCamera2Plugin/Android/src/com/epicgames/ue4/Camera2Helper.java`:
+```java
+private int frameWidth = 800;   // Change this
+private int frameHeight = 600;  // Change this
+```
+
+2. **C++ Side (Texture Creation)** - Edit `Source/AndroidCamera2Plugin/Private/SimpleCamera2Test.cpp`:
+```cpp
+CameraTexture = UTexture2D::CreateTransient(800, 600, PF_B8G8R8A8);
+```
+
+3. **C++ Side (Memory Initialization)** - Same file, a few lines below:
+```cpp
+FMemory::Memset(TextureData, 64, 800 * 600 * 4); // width * height * 4(RGBA)
+```
+
+**After Changes:**
+1. Clean build folders: Delete `Intermediate` and `Binaries` folders in both plugin and project
+2. Regenerate project files
+3. Rebuild the project
+
+⚠️ **Warning**: If these three values don't match, you'll get memory access violations and texture corruption.
+
 ### Current Limitations (v1.0)
 - **Color accuracy issues** - Full color YUV to RGB conversion implemented but may show warm/orange tint
-- **Fixed resolution** - 320x240 pixels (hardcoded, requires code modification to change)
 - **Color space calibration needed** - Quest 3 cameras may use specific color space requiring fine-tuning
 - These are temporary limitations for the initial release
 
