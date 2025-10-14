@@ -171,17 +171,17 @@ bool USimpleCamera2Test::StartCameraPreview()
     UE_LOG(LogSimpleCamera2, Warning, TEXT("=== CHECKING CAMERA TEXTURE ==="));
     if (!CameraTexture)
     {
-        UE_LOG(LogSimpleCamera2, Warning, TEXT("Creating new camera texture 320x240"));
-        CameraTexture = UTexture2D::CreateTransient(320, 240, PF_B8G8R8A8);
+        UE_LOG(LogSimpleCamera2, Warning, TEXT("Creating new camera texture 800x600"));
+        CameraTexture = UTexture2D::CreateTransient(800, 600, PF_B8G8R8A8);
         if (CameraTexture)
         {
             UE_LOG(LogSimpleCamera2, Warning, TEXT("Camera texture created successfully"));
             CameraTexture->AddToRoot(); // Prevent garbage collection
-            
+
             // Initialize with dark pattern to show it's waiting for camera
             FTexture2DMipMap& Mip = CameraTexture->GetPlatformData()->Mips[0];
             void* TextureData = Mip.BulkData.Lock(LOCK_READ_WRITE);
-            FMemory::Memset(TextureData, 64, 320 * 240 * 4); // Dark gray
+            FMemory::Memset(TextureData, 64, 800 * 600 * 4); // Dark gray
             Mip.BulkData.Unlock();
             CameraTexture->UpdateResource();
         }

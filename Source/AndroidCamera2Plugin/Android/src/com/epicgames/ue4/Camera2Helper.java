@@ -33,8 +33,8 @@ public class Camera2Helper {
     
     // Frame data storage
     private byte[] latestFrameData;
-    private int frameWidth = 320;
-    private int frameHeight = 240;
+    private int frameWidth = 800;
+    private int frameHeight = 600;
     private boolean isCapturing = false;
     
     // Native callback
