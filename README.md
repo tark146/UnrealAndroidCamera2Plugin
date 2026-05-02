@@ -1,177 +1,232 @@
-# Android Camera2 Plugin for Unreal Engine
+## meta quest camera2 plugin for unreal engine
 
-English | [日本語](README_JP.md)
+simple, fast camera2 access for unreal engine projects on android and meta quest. streams camera frames into a UE texture for realtime use in games and XR apps. this is a fork of the original by @tark146 but since they are not seeming to be merging pull requests - this is now where I will be maintaining and pushing changes.
 
-## Motivation
-Unreal Engine lacks official Camera2 API support, creating a significant barrier for XR developers who want to access device cameras on Android and Meta Quest platforms. This plugin bridges that gap by handling the complex Java/JNI integration that most Unreal developers aren't familiar with.
+### what it does
+- allows you to quickly access your quest passthrough cameras
+- camera2 frame path wired to a UE `Texture2D` with BGRA8 updates on the render thread
+- **deterministic camera selection** (left camera ID 50 by default, or explicitly select left/right)
+- camera intrinsics exposed (fx, fy, cx, cy, skew) - **automatically adjusted for stream resolution**
+- **camera pose (CamInHmd)** extracted from device calibration for accurate spatial tracking
+- lens distortion coefficients retrieved and mapped for UE usage
+- camera characteristics JSON dump available for diagnostics
+- **quest 3 hardcoded calibration fallback** when runtime data isn't available
+- blueprint getters for texture, intrinsics, distortion, pose, and resolutions
 
-The goal is to **accelerate XR development in Unreal Engine** by providing easy camera access, enabling developers to focus on creating innovative XR experiences rather than wrestling with platform-specific implementations.
+---
 
-## Overview
-This plugin provides Camera2 API access for Unreal Engine projects, specifically designed for Android and Meta Quest devices. It enables real-time camera feed capture and display as a texture within your Unreal Engine application.
+## quick start
 
-## Features
-- Android Camera2 API integration
-- Real-time camera preview to UE texture
-- Support for Meta Quest 3 passthrough cameras
-- Full color YUV to RGBA conversion (with color calibration in progress)
-- Simple Blueprint interface
+1. enable the plugin in your project
+2. call `StartCameraPreview` (blueprint) or `StartCameraPreviewWithSelection(true/false)` for explicit L/R
+3. get the camera texture and apply it to a material/mesh or UI image
+4. for pose estimation, use `GetCurrentQuest3Calibration()` to get properly adjusted intrinsics and CamInHmd
+5. call `StopCameraPreview` when done
 
-## Supported Platforms
-- Android (including Meta Quest 2/3/Pro)
-- Windows (Editor only - returns null texture)
+---
 
-## Requirements
-- Unreal Engine 5.0 or later
-- Android SDK Level 21+ (Android 5.0 Lollipop)
-- Camera permissions in Android Manifest
+## requirements
+- unreal engine 5.0+
+- android SDK 21+
+- camera permissions enabled on device
+- works on standalone android (including meta quest 2/3/pro)
+- windows editor: returns null texture (for workflow only)
 
-## Tested Environment
-- **Unreal Engine**: 5.3
-- **Device**: Meta Quest 3
-- **Camera ID**: 50 (Quest 3 passthrough camera)
-- **OS**: Quest system software (Android-based)
+---
 
-## Installation
+## installation
 
-1. Copy the `AndroidCamera2Plugin` folder to your project's `Plugins` directory
-2. Regenerate project files
-3. Enable the plugin in your project settings or .uproject file
+1. copy the `AndroidCamera2Plugin` folder to your project's `Plugins` directory
+2. regenerate project files
+3. enable the plugin in your project settings or .uproject file
 
-## Usage
+---
 
-### Blueprint Setup
+## API reference
 
-1. **Start Camera Preview:**
-   ```
-   SimpleCamera2Test::StartCameraPreview() -> bool
-   ```
-   Returns true if camera started successfully
+### core camera functions
 
-2. **Get Camera Texture:**
-   ```
-   SimpleCamera2Test::GetCameraTexture() -> Texture2D
-   ```
-   Returns the camera feed texture (can be null if not started)
+| function | description |
+|----------|-------------|
+| `StartCameraPreview()` | start camera (defaults to LEFT camera) |
+| `StartCameraPreviewWithSelection(bool bUseLeftCamera)` | start with explicit L/R selection |
+| `StopCameraPreview()` | stop camera and release resources |
+| `GetCameraTexture()` | get the camera feed texture (null if not started) |
 
-3. **Stop Camera Preview:**
-   ```
-   SimpleCamera2Test::StopCameraPreview()
-   ```
-   Stops the camera and releases resources
+### camera selection (quest 3: ID 50 = left, ID 51 = right)
 
-### Quick Start with Sample Blueprint
+| function | description |
+|----------|-------------|
+| `SetPreferredCamera(bool bUseLeftCamera)` | set preference before starting |
+| `GetPreferredCamera()` | get current preference |
+| `GetSelectedCameraId()` | get the active camera ID (e.g., "50") |
+| `IsLeftCamera()` | check if left camera is active |
 
-1. **Using the provided sample:**
-   - Place `BP_CameraImage` actor (found in the plugin content) into your level
-   - This actor contains a Widget with complete Blueprint implementation
-   - Refer to the Widget Blueprint for implementation details
+### intrinsics (stream-adjusted)
 
-2. **Manual Blueprint Implementation:**
-   - Create a new Actor Blueprint
-   - Add a Plane or UI Image component
-   - In BeginPlay:
-     - Call `StartCameraPreview`
-     - Get the camera texture using `GetCameraTexture`
-     - Create a Dynamic Material Instance
-     - Set the texture parameter to the camera texture
-     - Apply the material to your plane/image
+| function | description |
+|----------|-------------|
+| `GetCameraFx()` | focal length X (pixels, for stream resolution) |
+| `GetCameraFy()` | focal length Y (pixels, for stream resolution) |
+| `GetPrincipalPoint()` | principal point (cx, cy) |
+| `GetCameraSkew()` | skew coefficient |
+| `GetCalibrationResolution()` | resolution these intrinsics are for |
+| `GetOriginalResolution()` | native sensor resolution (1280x1280) |
 
-### C++ Usage
+### camera pose (CamInHmd)
 
-```cpp
-#include "SimpleCamera2Test.h"
+| function | description |
+|----------|-------------|
+| `IsCameraPoseAvailable()` | check if device provided pose data |
+| `GetCameraPoseTranslation()` | camera position in HMD space (cm, UE coords) |
+| `GetCameraPoseRotation()` | camera rotation in HMD space (UE coords) |
+| `GetCamInHmdTransform()` | full transform for use in pose estimation |
 
-// Start camera
-bool bSuccess = USimpleCamera2Test::StartCameraPreview();
+### quest 3 calibration (hardcoded fallback)
 
-// Get texture
-UTexture2D* CameraTexture = USimpleCamera2Test::GetCameraTexture();
+| function | description |
+|----------|-------------|
+| `GetQuest3Calibration(bool bLeftCamera, int32 StreamWidth, int32 StreamHeight)` | get hardcoded calibration for L/R camera |
+| `GetCurrentQuest3Calibration(int32 StreamWidth, int32 StreamHeight)` | get calibration for active camera |
 
-// Stop camera
-USimpleCamera2Test::StopCameraPreview();
-```
+the `FQuest3CameraCalibration` struct contains:
+- `CameraId`, `bIsLeftCamera` - camera identification
+- `NativeFx/Fy/Cx/Cy` - intrinsics for native 1280x1280 sensor
+- `StreamFx/Fy/Cx/Cy` - intrinsics adjusted for your stream resolution
+- `NativeWidth/Height`, `StreamWidth/Height` - resolutions
+- `PoseTranslationCm`, `PoseRotation` - CamInHmd pose (UE coordinates)
+- `GetCamInHmdTransform()` - helper to get FTransform
 
-## Permissions
+### lens distortion
 
-### Important Note: First Run Permission Dialog
+| function | description |
+|----------|-------------|
+| `GetLensDistortion()` | raw distortion coefficients from device |
+| `GetLensDistortionUE()` | mapped to UE order [K1,K2,P1,P2,K3,K4,K5,K6] |
 
-**On first app launch**, Android will display a permission request dialog for camera access. Please grant all camera permissions and **restart the application** to enable camera functionality.
+### diagnostics
 
-These permissions should normally be auto-granted via UE's `ExtraPermissions`, but this is currently not working properly. Sorry for the inconvenience - this is the current specification.
+| function | description |
+|----------|-------------|
+| `GetCameraCharacteristics(bool bRedump, FString& OutJson, FString& OutFilePath)` | get full characteristics JSON |
 
-The plugin automatically adds the following permissions to your Android manifest:
+---
 
+## quest 3 camera specifications
+
+### hardware
+- **left camera**: ID 50
+- **right camera**: ID 51
+- **native resolution**: 1280x1280 (square sensor)
+- **stream resolution**: 1280x960 (center-cropped to 4:3)
+- **FOV**: ~110° (wide angle, some barrel distortion)
+
+### intrinsics (native 1280x1280)
+
+| camera | fx | fy | cx | cy |
+|--------|-----|-----|-------|-------|
+| left (50) | 870.60 | 870.60 | 640.25 | 641.24 |
+| right (51) | 869.41 | 869.41 | 635.98 | 636.24 |
+
+### intrinsics adjustment for stream resolution
+
+when streaming at 1280x960 (center crop from 1280x1280):
+- **focal lengths unchanged** (pixels aren't scaled, just cropped)
+- **principal point shifted**: cy_stream = cy_native - 160
+
+for left camera at 1280x960:
+- fx = 870.60, fy = 870.60, cx = 640.25, **cy = 481.24**
+
+### camera pose (CamInHmd) in UE coordinates
+
+**translation:**
+
+| camera | X (forward) | Y (right) | Z (up) |
+|--------|-------------|-----------|--------|
+| Left (50) | 6.29 cm | -3.19 cm | -1.72 cm |
+| Right (51) | 6.28 cm | 3.17 cm | -1.71 cm |
+
+**rotation:** Both cameras are tilted approximately **11° downward** (negative pitch in UE).
+
+the cameras are positioned ~6.3cm forward of the HMD center, ~3.2cm to the side, and ~1.7cm below.
+---
+
+
+## coordinate System Conversion
+
+the plugin automatically converts Android/OpenGL coordinates to UE coordinates.
+
+**validated against Meta's official Unity sample** which produces:
+- Lens Offset Position: `(-0.03, -0.02, 0.06)` meters
+- Lens Offset Rotation: `(11.24°, 0.26°, 359.50°)` Euler angles
+
+
+### translation
+
+**Android/OpenGL**: X-right, Y-up, Z-backward (toward user)
+**Unreal Engine**: X-forward, Y-right, Z-up
+
+Formula: `UE = (-Android_Z * 100, Android_X * 100, Android_Y * 100)` (meters → cm)
+
+### rotation
+
+the rotation conversion follows Meta's Unity approach:
+1. Negate X and Y components of the Android quaternion
+2. Compute the inverse (conjugate)
+3. Apply 180° rotation around the X axis (accounts for optical axis direction)
+4. Transform from Unity to UE coordinate axes
+
+this produces approximately **-11° pitch** in UE (looking down), matching the physical camera orientation.
+
+---
+
+## permissions
+
+android will display a permission request dialog for camera access. grant all camera permissions and **restart the application** to enable camera functionality. restart isn't strictly needed but encouraged especially for first bootup.
+
+the plugin automatically adds:
 - `android.permission.CAMERA`
 - `horizonos.permission.HEADSET_CAMERA` (Meta Quest)
 - `horizonos.permission.AVATAR_CAMERA` (Meta Quest)
 
-## Technical Details
+---
 
-### Architecture
-- **C++ Layer**: UObject-based interface for Blueprint/C++ access
-- **JNI Bridge**: Native C++ to Java communication
-- **Java Layer**: Camera2 API implementation with ImageReader
-- **Frame Processing**: YUV_420_888 to RGBA conversion
+## architecture
 
-### Camera Selection Priority
-1. Meta Quest special cameras (ID 50, 51) - for passthrough
-2. Front-facing camera
-3. Back-facing camera
-4. Any available camera as fallback
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        blueprint                            │
+├─────────────────────────────────────────────────────────────┤
+│                    SimpleCamera2Test.cpp                    │
+│  - JNI callbacks receive frame/intrinsics/pose data         │
+│  - blueprint accessors expose data to game logic            │
+│  - Quest 3 hardcoded calibration as fallback                │
+├─────────────────────────────────────────────────────────────┤
+│                    Camera2Helper.java                       │
+│  - Camera2 API session management                           │
+│  - intrinsics extraction & stream-adjustment                │
+│  - camera pose extraction (LENS_POSE_*)                     │
+│  - YUV→RGBA conversion                                      │
+│  - deterministic camera selection (prefers left=50)         │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### Performance
-- Default resolution: 320x240 (configurable in code)
-- Frame format: YUV_420_888 -> BGRA8
-- Processing: Background thread for camera operations
-- Texture update: Game thread synchronized
+---
 
-### Current Limitations (v1.0)
-- **Color accuracy issues** - Full color YUV to RGB conversion implemented but may show warm/orange tint
-- **Fixed resolution** - 320x240 pixels (hardcoded, requires code modification to change)
-- **Color space calibration needed** - Quest 3 cameras may use specific color space requiring fine-tuning
-- These are temporary limitations for the initial release
+## current limitations
+- Quest 3 does not report lens distortion via Camera2 API (use approximate values)
+- resolution selection is fixed in code (1280x960)
 
-## Known Issues
-- Initial frames may appear dark until camera auto-exposure adjusts
-- Quest 3 passthrough cameras require special permissions
-- Camera preview may not work in editor (Android only)
+---
 
-## Troubleshooting
+## troubleshooting
 
-### Camera not starting
-- Check Android logcat for permission errors
-- Verify camera permissions are granted
-- Ensure no other app is using the camera
+| issue | solution |
+|-------|----------|
+| black texture | Wait for auto-exposure, check logcat for errors |
+| camera not starting | Grant permissions and restart app |
+| intrinsics are 0 | Camera not started yet, use hardcoded fallback |
+---
 
-### Black/Dark texture
-- Camera auto-exposure may need time to adjust
-- Check if YUV data is being received (see logs)
-- Verify texture format compatibility
-
-### Quest specific issues
-- Ensure Quest-specific permissions are granted
-- Try camera IDs 50 or 51 for passthrough cameras
-- Check if passthrough is enabled in system settings
-
-## License
-MIT License - See LICENSE file for details
-
-## Development Notes
-This plugin was developed through extensive trial and error with AI assistance. While AI helped with code generation and problem-solving, the actual implementation required countless iterations, debugging sessions, and real device testing to get the Camera2 API working properly with Unreal Engine. The journey from "camera not found" to "real-time texture streaming" was filled with challenges, but that's exactly why this plugin needed to exist - so others don't have to go through the same struggle.
-
-## Author
-TARK (Olachat)
-
-## Support
-For issues and questions, please create an issue in the GitHub repository.
-
-## Changelog
-
-### Version 1.0
-- Initial release
-- Basic Camera2 API integration
-- Meta Quest support
-- Grayscale preview (YUV Y-channel only)
-- 320x240 fixed resolution
-- Note: Color support and configurable resolution planned for future versions
+## contribution
+make changes, PR and contribute! :)

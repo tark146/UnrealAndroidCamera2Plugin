@@ -12,11 +12,21 @@ import android.media.ImageReader;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Environment;
 import android.util.Log;
+import android.util.SizeF;
 import android.view.Surface;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import android.Manifest;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.List;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
 
 public class Camera2Helper {
     private static final String TAG = "Camera2Helper";
@@ -33,12 +43,20 @@ public class Camera2Helper {
     
     // Frame data storage
     private byte[] latestFrameData;
-    private int frameWidth = 320;
-    private int frameHeight = 240;
+    private int frameWidth = 1280;
+    private int frameHeight = 960;
     private boolean isCapturing = false;
     
     // Native callback
     private static native void onFrameAvailable(byte[] data, int width, int height);
+    private static native void onIntrinsicsAvailable(float fx, float fy, float cx, float cy, float skew, int width, int height);
+    private static native void onDistortionAvailable(float[] coeffs, int length);
+    private static native void onOriginalResolutionAvailable(int width, int height);
+    private static native void onPixelArraySizeAvailable(int width, int height);
+    private static native void onActiveArraySizeAvailable(int width, int height);
+    private static native void onCharacteristicsDumpAvailable(String json);
+    private static native void onCameraSelected(String cameraId, boolean isLeftCamera);
+    private static native void onCameraPoseAvailable(float tx, float ty, float tz, float qx, float qy, float qz, float qw);
     
     private Camera2Helper(Context ctx) {
         this.context = ctx;
@@ -121,28 +139,56 @@ public class Camera2Helper {
             
             // Check all cameras and their characteristics - prioritize Quest 3 special cameras
             String cameraId = null;
+            boolean isLeftCamera = false;
             
-            // First pass: look for Quest 3 special cameras (50, 51)
+            // First pass: look for Quest 3 special cameras (50 = left, 51 = right)
+            boolean has50 = false;
+            boolean has51 = false;
             for (String id : cameraIds) {
-                if (id.equals("50") || id.equals("51")) {
-                    Log.d(TAG, "=== Camera ID: " + id + " (PRIORITY) ===");
-                    try {
-                        CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(id);
-                        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-                        String facingStr = "UNKNOWN";
-                        if (facing != null) {
-                            if (facing == CameraCharacteristics.LENS_FACING_FRONT) facingStr = "FRONT";
-                            else if (facing == CameraCharacteristics.LENS_FACING_BACK) facingStr = "BACK";
-                            else if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) facingStr = "EXTERNAL";
-                        }
-                        Log.d(TAG, "Priority Camera " + id + " facing: " + facingStr + " (value=" + facing + ")");
-                        
-                        cameraId = id;
-                        Log.d(TAG, "Selected Quest 3 special camera ID: " + id + " (" + facingStr + ")");
-                        break; // Use first special camera found
-                    } catch (Exception e) {
-                        Log.w(TAG, "Could not get characteristics for priority camera " + id + ": " + e.getMessage());
+                if (id.equals("50")) has50 = true;
+                if (id.equals("51")) has51 = true;
+            }
+            
+            // Use the camera based on preference (set via setPreferredCamera)
+            Log.d(TAG, "Camera preference: " + (preferLeftCamera ? "LEFT" : "RIGHT"));
+            
+            if (preferLeftCamera) {
+                // Prefer left camera (50)
+                if (has50) {
+                    cameraId = "50";
+                    isLeftCamera = true;
+                    Log.d(TAG, "Selected Quest 3 LEFT camera (ID 50) - matches preference");
+                } else if (has51) {
+                    cameraId = "51";
+                    isLeftCamera = false;
+                    Log.d(TAG, "Selected Quest 3 RIGHT camera (ID 51) - fallback (left not available)");
+                }
+            } else {
+                // Prefer right camera (51)
+                if (has51) {
+                    cameraId = "51";
+                    isLeftCamera = false;
+                    Log.d(TAG, "Selected Quest 3 RIGHT camera (ID 51) - matches preference");
+                } else if (has50) {
+                    cameraId = "50";
+                    isLeftCamera = true;
+                    Log.d(TAG, "Selected Quest 3 LEFT camera (ID 50) - fallback (right not available)");
+                }
+            }
+            
+            if (cameraId != null) {
+                try {
+                    CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
+                    Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+                    String facingStr = "UNKNOWN";
+                    if (facing != null) {
+                        if (facing == CameraCharacteristics.LENS_FACING_FRONT) facingStr = "FRONT";
+                        else if (facing == CameraCharacteristics.LENS_FACING_BACK) facingStr = "BACK";
+                        else if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) facingStr = "EXTERNAL";
                     }
+                    Log.d(TAG, "Quest 3 Camera " + cameraId + " facing: " + facingStr + " (isLeft=" + isLeftCamera + ")");
+                } catch (Exception e) {
+                    Log.w(TAG, "Could not get characteristics for camera " + cameraId + ": " + e.getMessage());
                 }
             }
             
@@ -199,7 +245,155 @@ public class Camera2Helper {
             } else {
                 Log.d(TAG, "Selected camera ID: " + cameraId);
             }
+            // Remember selection for dumps
+            this.currentCameraId = cameraId;
+            this.currentIsLeftCamera = isLeftCamera;
             
+            // Notify native side which camera was selected
+            try {
+                onCameraSelected(cameraId, isLeftCamera);
+                Log.d(TAG, "Notified native: camera=" + cameraId + " isLeft=" + isLeftCamera);
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to notify camera selection: " + e.getMessage());
+            }
+            
+            // Trigger an immediate dump of characteristics for this camera
+            try { dumpCameraCharacteristics(); } catch (Exception e) { Log.w(TAG, "Auto dump failed: " + e.getMessage()); }
+            
+            // Query intrinsics for selected camera (if available)
+            try {
+                CameraCharacteristics cc = cameraManager.getCameraCharacteristics(cameraId);
+                float[] intr = cc.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION);
+                float fx = 0, fy = 0, cx = 0, cy = 0, skew = 0;
+                if (intr != null && intr.length >= 4) {
+                    fx = intr[0]; fy = intr[1]; cx = intr[2]; cy = intr[3];
+                    if (intr.length >= 5) { skew = intr[4]; }
+                    Log.d(TAG, "Intrinsics found: fx="+fx+" fy="+fy+" cx="+cx+" cy="+cy+" skew="+skew);
+                } else {
+                    Log.w(TAG, "LENS_INTRINSIC_CALIBRATION not available or too short");
+                }
+
+                // Also try focal lengths in pixels if available
+                float[] focalLengthsMm = cc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+                SizeF sensorSizeMm = cc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+                Integer pixelArrayW = cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) != null ?
+                        cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE).getWidth() : null;
+                Integer pixelArrayH = cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) != null ?
+                        cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE).getHeight() : null;
+                if ((fx == 0 || fy == 0) && focalLengthsMm != null && focalLengthsMm.length > 0 && sensorSizeMm != null && pixelArrayW != null && pixelArrayH != null) {
+                    float pixelsPerMmX = pixelArrayW / sensorSizeMm.getWidth();
+                    float pixelsPerMmY = pixelArrayH / sensorSizeMm.getHeight();
+                    fx = focalLengthsMm[0] * pixelsPerMmX;
+                    fy = focalLengthsMm[0] * pixelsPerMmY;
+                    cx = pixelArrayW * 0.5f;
+                    cy = pixelArrayH * 0.5f;
+                    Log.d(TAG, "Derived intrinsics from focal length: fx="+fx+" fy="+fy+" cx="+cx+" cy="+cy);
+                }
+
+                // Send original sensor/active-array resolution so UE can scale intrinsics
+                int srcW = 0, srcH = 0;
+                try {
+                    android.util.Size pixelArray = cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+                    if (pixelArray != null) {
+                        srcW = pixelArray.getWidth();
+                        srcH = pixelArray.getHeight();
+                        Log.d(TAG, "Pixel array size: " + srcW + "x" + srcH);
+                        onPixelArraySizeAvailable(srcW, srcH);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "SENSOR_INFO_PIXEL_ARRAY_SIZE unavailable: " + e.getMessage());
+                }
+
+                if (srcW == 0 || srcH == 0) {
+                    try {
+                        android.graphics.Rect active = cc.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                        if (active != null) {
+                            srcW = active.width();
+                            srcH = active.height();
+                            Log.d(TAG, "Active array size: " + srcW + "x" + srcH);
+                            onActiveArraySizeAvailable(srcW, srcH);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "ACTIVE_ARRAY_SIZE unavailable: " + e.getMessage());
+                    }
+                }
+
+                if (srcW > 0 && srcH > 0) {
+                    onOriginalResolutionAvailable(srcW, srcH);
+                }
+
+                // Try to fetch distortion coefficients (varies by device)
+                float[] lensDist = null;
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        // Brown model: k1, k2, p1, p2, k3 (and optionally higher order)
+                        lensDist = cc.get(CameraCharacteristics.LENS_DISTORTION);
+						if (lensDist != null) {
+							Log.d(TAG, "Using CameraCharacteristics.LENS_DISTORTION, length=" + lensDist.length);
+						}
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "LENS_DISTORTION unavailable: " + e.getMessage());
+                }
+
+                if (lensDist == null) {
+                    try {
+                        lensDist = cc.get(CameraCharacteristics.LENS_RADIAL_DISTORTION);
+						if (lensDist != null) {
+							Log.d(TAG, "Using CameraCharacteristics.LENS_RADIAL_DISTORTION, length=" + lensDist.length);
+						}
+                    } catch (Exception e) {
+                        Log.w(TAG, "LENS_RADIAL_DISTORTION unavailable: " + e.getMessage());
+                    }
+                }
+
+                if (lensDist != null && lensDist.length > 0) {
+                    Log.d(TAG, "Distortion length=" + lensDist.length);
+                    onDistortionAvailable(lensDist, lensDist.length);
+                } else {
+                    Log.d(TAG, "No distortion array available on this device");
+                }
+
+                // CRITICAL: Compute intrinsics adjusted for the output stream resolution (center crop + scale)
+                // The raw intrinsics are for the full sensor (e.g., 1280x1280), but we're outputting
+                // a different resolution (e.g., 1280x960). The principal point especially needs adjustment.
+                Intr kStream = intrinsicsForStream(fx, fy, cx, cy, srcW, srcH, frameWidth, frameHeight);
+                
+                Log.d(TAG, "Original intrinsics: fx=" + fx + " fy=" + fy + " cx=" + cx + " cy=" + cy + " (for " + srcW + "x" + srcH + ")");
+                Log.d(TAG, "Adjusted intrinsics: fx=" + kStream.fx + " fy=" + kStream.fy + " cx=" + kStream.cx + " cy=" + kStream.cy + " (for " + frameWidth + "x" + frameHeight + ")");
+                
+                // Send ADJUSTED intrinsics that match the output stream resolution
+                onIntrinsicsAvailable(kStream.fx, kStream.fy, kStream.cx, kStream.cy, skew, frameWidth, frameHeight);
+
+                onOriginalResolutionAvailable(srcW, srcH); // keep sending this if your native side logs it
+                
+                // Try to extract and send camera pose (CamInHmd) if available
+                try {
+                    float[] poseTranslation = cc.get(CameraCharacteristics.LENS_POSE_TRANSLATION);
+                    float[] poseRotation = cc.get(CameraCharacteristics.LENS_POSE_ROTATION);
+                    if (poseTranslation != null && poseTranslation.length >= 3 &&
+                        poseRotation != null && poseRotation.length >= 4) {
+                        // Pose translation is in meters, rotation is quaternion (x, y, z, w)
+                        Log.d(TAG, "Camera pose found - Translation: [" + 
+                              poseTranslation[0] + ", " + poseTranslation[1] + ", " + poseTranslation[2] + "]");
+                        Log.d(TAG, "Camera pose found - Rotation: [" + 
+                              poseRotation[0] + ", " + poseRotation[1] + ", " + poseRotation[2] + ", " + poseRotation[3] + "]");
+                        onCameraPoseAvailable(
+                            poseTranslation[0], poseTranslation[1], poseTranslation[2],
+                            poseRotation[0], poseRotation[1], poseRotation[2], poseRotation[3]);
+                    } else {
+                        Log.d(TAG, "Camera pose not available from characteristics");
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to get camera pose: " + e.getMessage());
+                }
+
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to get intrinsics: "+e.getMessage());
+            }
+
+            
+
             // Setup ImageReader for camera frames
             Log.d(TAG, "Creating ImageReader " + frameWidth + "x" + frameHeight);
             imageReader = ImageReader.newInstance(frameWidth, frameHeight, 
@@ -263,6 +457,267 @@ public class Camera2Helper {
             return false;
         }
     }
+
+    private static class Intr {
+        float fx, fy, cx, cy;
+    }
+
+    private static android.graphics.Rect centerCrop(int srcW, int srcH, int dstW, int dstH) {
+        float srcAspect = (float) srcW / (float) srcH;
+        float dstAspect = (float) dstW / (float) dstH;
+        if (dstAspect > srcAspect) {
+            // Wider output: crop height
+            int cropH = Math.round(srcW / dstAspect);
+            int top = (srcH - cropH) / 2;
+            return new android.graphics.Rect(0, top, srcW, top + cropH);
+        } else {
+            // Taller output: crop width
+            int cropW = Math.round(srcH * dstAspect);
+            int left = (srcW - cropW) / 2;
+            return new android.graphics.Rect(left, 0, left + cropW, srcH);
+        }
+    }
+
+    // Remember currently selected camera for dumps
+    private String currentCameraId;
+    // Remember if current camera is left (50) or right (51)
+    private boolean currentIsLeftCamera;
+    
+    // Static preference for which camera to use (set before startCamera)
+    // true = left camera (ID 50), false = right camera (ID 51)
+    private static boolean preferLeftCamera = true;
+    
+    /**
+     * Set the preferred camera before calling startCamera.
+     * @param useLeft true for left camera (ID 50), false for right camera (ID 51)
+     */
+    public static void setPreferredCamera(boolean useLeft) {
+        preferLeftCamera = useLeft;
+        Log.d(TAG, "Camera preference set to: " + (useLeft ? "LEFT (50)" : "RIGHT (51)"));
+    }
+    
+    /**
+     * Get the current camera preference.
+     * @return true if left camera is preferred
+     */
+    public static boolean getPreferredCamera() {
+        return preferLeftCamera;
+    }
+	// Remember last saved dump file path
+	private String lastCharacteristicsDumpPath;
+	// Remember last JSON text
+	private String lastCharacteristicsDumpJson;
+
+    // Public method to dump all CameraCharacteristics to JSON and send to native
+    public void dumpCameraCharacteristics() {
+        try {
+            if (cameraManager == null) {
+                Log.e(TAG, "cameraManager is null; cannot dump characteristics");
+                return;
+            }
+            String id = currentCameraId;
+            if (id == null) {
+                // Try a best-effort default
+                String[] ids = cameraManager.getCameraIdList();
+                if (ids != null && ids.length > 0) {
+                    id = ids[0];
+                }
+            }
+            if (id == null) {
+                Log.e(TAG, "No cameraId available for dump");
+                return;
+            }
+
+            CameraCharacteristics cc = cameraManager.getCameraCharacteristics(id);
+            JSONObject root = new JSONObject();
+            root.put("cameraId", id);
+            root.put("sdk", Build.VERSION.SDK_INT);
+
+            JSONObject values = new JSONObject();
+            // Prefer official getKeys() when available
+            boolean dumpedAny = false;
+            try {
+                Method getKeysMethod = CameraCharacteristics.class.getMethod("getKeys");
+                @SuppressWarnings("unchecked")
+                List<CameraCharacteristics.Key<?>> keys = (List<CameraCharacteristics.Key<?>>) getKeysMethod.invoke(cc);
+                if (keys != null) {
+                    for (CameraCharacteristics.Key<?> key : keys) {
+                        String keyName = getKeyName(key);
+                        Object val = safeGet(cc, key);
+                        values.put(keyName, toJsonValue(val));
+                        dumpedAny = true;
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "getKeys() unavailable; will use reflection fallback: " + t.getMessage());
+            }
+
+            if (!dumpedAny) {
+                // Reflection fallback: static fields of type CameraCharacteristics.Key
+                for (Field f : CameraCharacteristics.class.getFields()) {
+                    try {
+                        if (CameraCharacteristics.Key.class.isAssignableFrom(f.getType())) {
+                            @SuppressWarnings("unchecked")
+                            CameraCharacteristics.Key<?> key = (CameraCharacteristics.Key<?>) f.get(null);
+                            if (key != null) {
+                                // Prefer the public constant field name for readability
+                                String keyName = f.getName();
+                                Object val = safeGet(cc, key);
+                                values.put(keyName, toJsonValue(val));
+                            }
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }
+
+            root.put("values", values);
+            String json = root.toString();
+            Log.d(TAG, "Dumped CameraCharacteristics JSON length=" + json.length());
+			lastCharacteristicsDumpJson = json;
+			// Also persist the dump to a file accessible via adb (scoped storage safe)
+			try {
+				String fileName = "camera_characteristics_" + id + ".json";
+				saveJsonToFile(fileName, json);
+			} catch (Exception e) {
+				Log.w(TAG, "Failed to save characteristics JSON to file: " + e.getMessage());
+			}
+            onCharacteristicsDumpAvailable(json);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to dump CameraCharacteristics: " + e.getMessage());
+        }
+    }
+
+    private static Object safeGet(CameraCharacteristics cc, CameraCharacteristics.Key<?> key) {
+        try {
+            @SuppressWarnings("unchecked")
+            Object val = cc.get((CameraCharacteristics.Key<Object>) key);
+            return val;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String getKeyName(CameraCharacteristics.Key<?> key) {
+        try {
+            Method m = key.getClass().getMethod("getName");
+            m.setAccessible(true);
+            Object name = m.invoke(key);
+            if (name != null) return name.toString();
+        } catch (Throwable ignored) { }
+        // Fallback to toString()
+        try {
+            String s = key.toString();
+            return s != null ? s : "<unknown>";
+        } catch (Throwable t) {
+            return "<unknown>";
+        }
+    }
+
+    private static Object toJsonValue(Object val) {
+        if (val == null) return JSONObject.NULL;
+        if (val instanceof Number || val instanceof Boolean || val instanceof String) return val;
+        if (val instanceof android.util.Size) {
+            android.util.Size s = (android.util.Size) val;
+            JSONObject o = new JSONObject();
+            try { o.put("width", s.getWidth()); o.put("height", s.getHeight()); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val instanceof android.graphics.Rect) {
+            android.graphics.Rect r = (android.graphics.Rect) val;
+            JSONObject o = new JSONObject();
+            try { o.put("left", r.left); o.put("top", r.top); o.put("right", r.right); o.put("bottom", r.bottom); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val instanceof android.util.Range) {
+            android.util.Range<?> r = (android.util.Range<?>) val;
+            JSONObject o = new JSONObject();
+            try { o.put("lower", String.valueOf(r.getLower())); o.put("upper", String.valueOf(r.getUpper())); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val instanceof SizeF) {
+            SizeF s = (SizeF) val;
+            JSONObject o = new JSONObject();
+            try { o.put("width", s.getWidth()); o.put("height", s.getHeight()); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val.getClass().isArray()) {
+            JSONArray arr = new JSONArray();
+            int len = java.lang.reflect.Array.getLength(val);
+            for (int i = 0; i < len; i++) {
+                Object e = java.lang.reflect.Array.get(val, i);
+                arr.put(toJsonValue(e));
+            }
+            return arr;
+        }
+        if (val instanceof java.util.Collection) {
+            JSONArray arr = new JSONArray();
+            for (Object e : (java.util.Collection<?>) val) arr.put(toJsonValue(e));
+            return arr;
+        }
+        // Fallback
+        return String.valueOf(val);
+    }
+
+    private static Intr intrinsicsForStream(float fx, float fy, float cx, float cy,  int sensorW, int sensorH, int outW, int outH) {
+        android.graphics.Rect crop = centerCrop(sensorW, sensorH, outW, outH);
+        float sx = (float) outW / (float) crop.width();
+        float sy = (float) outH / (float) crop.height();
+        Intr k = new Intr();
+        k.fx = fx * sx;
+        k.fy = fy * sy;
+        k.cx = (cx - crop.left) * sx;
+        k.cy = (cy - crop.top) * sy;
+        return k;
+    }
+	
+	private void saveJsonToFile(String fileName, String jsonContent) {
+		File baseDir = null;
+		try {
+			// Prefer Documents in the app-specific external files (no WRITE permission required)
+			baseDir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
+			if (baseDir == null) {
+				// Fallback to generic external files dir
+				baseDir = context.getExternalFilesDir(null);
+			}
+			if (baseDir == null) {
+				// Final fallback to internal files dir
+				baseDir = context.getFilesDir();
+			}
+			File outDir = new File(baseDir, "Camera2");
+			if (!outDir.exists()) {
+				//noinspection ResultOfMethodCallIgnored
+				outDir.mkdirs();
+			}
+			File outFile = new File(outDir, fileName);
+			try (FileOutputStream fos = new FileOutputStream(outFile, false)) {
+				byte[] bytes = jsonContent.getBytes(StandardCharsets.UTF_8);
+				fos.write(bytes);
+				fos.flush();
+			}
+			lastCharacteristicsDumpPath = outFile.getAbsolutePath();
+			Log.i(TAG, "CameraCharacteristics JSON saved: " + outFile.getAbsolutePath());
+		} catch (Throwable t) {
+			Log.w(TAG, "Error saving JSON to file in " + (baseDir != null ? baseDir.getAbsolutePath() : "<null>") + ": " + t.getMessage());
+		}
+	}
+	
+	// Exposed getters/wrappers for native side
+	public String getLastCharacteristicsDumpPath() {
+		return lastCharacteristicsDumpPath != null ? lastCharacteristicsDumpPath : "";
+	}
+	public String getLastCharacteristicsDumpJson() {
+		return lastCharacteristicsDumpJson != null ? lastCharacteristicsDumpJson : "";
+	}
+	
+	public String dumpCameraCharacteristicsAndReturnPath() {
+		dumpCameraCharacteristics();
+		return getLastCharacteristicsDumpPath();
+	}
+	
+	public String[] dumpCameraCharacteristicsAndReturnJsonAndPath() {
+		dumpCameraCharacteristics();
+		return new String[] { getLastCharacteristicsDumpJson(), getLastCharacteristicsDumpPath() };
+	}
     
     private void createCaptureSession() {
         try {

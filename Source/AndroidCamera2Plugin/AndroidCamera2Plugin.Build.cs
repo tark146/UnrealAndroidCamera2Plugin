@@ -12,6 +12,7 @@ public class AndroidCamera2Plugin : ModuleRules
 				"Core",
 				"CoreUObject",    // UObject、UTexture2D など
 				"Engine",         // UE 基本機能
+				"RenderCore",
 				"InputCore",      // 入力機能
 				"ApplicationCore" // FAndroidApplication::GetJavaEnv() を含む
 			}

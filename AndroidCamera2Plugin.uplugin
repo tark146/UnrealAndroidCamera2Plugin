@@ -10,17 +10,18 @@
 	"DocsURL": "https://github.com/olachat/AndroidCamera2Plugin",
 	"MarketplaceURL": "",
 	"SupportURL": "https://github.com/olachat/AndroidCamera2Plugin/issues",
+	"EngineVersion": "5.5.0",
 	"CanContainContent": true,
-	"IsBetaVersion": false,
-	"IsExperimentalVersion": false,
-	"Installed": false,
-	"EnabledByDefault": true,
+	"Installed": true,
 	"Modules": [
 		{
 			"Name": "AndroidCamera2Plugin",
 			"Type": "Runtime",
 			"LoadingPhase": "Default",
-			"WhitelistPlatforms": [ "Win64", "Android" ]
+			"PlatformAllowList": [
+				"Win64",
+				"Android"
+			]
 		}
 	]
 }
