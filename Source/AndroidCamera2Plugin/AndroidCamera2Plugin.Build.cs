@@ -29,10 +29,14 @@ public class AndroidCamera2Plugin : ModuleRules
 		{
 			// Basic Android support
 			PublicDependencyModuleNames.Add("Launch");
-			
-			// Enable APL for Java integration
+
 			string PluginPath = Utils.MakePathRelativeTo(ModuleDirectory, Target.RelativeEnginePath);
+
+			// APL for Java integration
 			AdditionalPropertiesForReceipt.Add("AndroidPlugin", System.IO.Path.Combine(PluginPath, "AndroidCamera2Plugin_APL.xml"));
+
+			// ZXing jar (expected at Source/ThirdParty/zxing-core-3.5.2.jar)
+			// Jar is pulled in via APL <addJars>; no need to add as native lib here.
 		}
 	}
 }

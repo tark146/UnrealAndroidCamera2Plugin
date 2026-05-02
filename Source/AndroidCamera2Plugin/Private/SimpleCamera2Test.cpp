@@ -2,6 +2,7 @@
 #include "Engine/Engine.h"
 #include "Async/AsyncWork.h"
 #include "Engine/Texture2D.h"
+#include "Misc/ScopeLock.h"
 
 DEFINE_LOG_CATEGORY(LogSimpleCamera2);
 
@@ -17,6 +18,30 @@ DEFINE_LOG_CATEGORY(LogSimpleCamera2);
 // Static variables for camera preview
 static UTexture2D* CameraTexture = nullptr;
 static bool bCameraPreviewActive = false;
+
+// Camera intrinsics storage
+static float GCameraFx = 0.0f;
+static float GCameraFy = 0.0f;
+static float GCameraCx = 0.0f;
+static float GCameraCy = 0.0f;
+static float GCameraSkew = 0.0f;
+static int32 GCameraCalibWidth = 0;
+static int32 GCameraCalibHeight = 0;
+static TArray<float> GLensDistortionCoeffs;
+static int32 GOriginalResolutionWidth = 0;
+static int32 GOriginalResolutionHeight = 0;
+static FString GCameraCharacteristicsJson;
+static FCriticalSection GCameraIntrinsicsMutex;
+
+// QR finder detection (ZXing)
+static FVector2D GQrBottomLeft = FVector2D::ZeroVector;
+static FVector2D GQrTopLeft = FVector2D::ZeroVector;
+static FVector2D GQrTopRight = FVector2D::ZeroVector;
+static float GQrModuleSize = 0.0f;
+static int32 GQrDimension = 0;
+static int64 GQrTimestampMs = 0;
+static bool GQrHasDetection = false;
+static FCriticalSection GQrMutex;
 
 #if PLATFORM_ANDROID
 static jobject Camera2HelperInstance = nullptr;
@@ -77,6 +102,125 @@ Java_com_epicgames_ue4_Camera2Helper_onFrameAvailable(JNIEnv* env, jclass clazz,
         // Clean up the copied data
         delete[] FrameDataCopy;
     });
+}
+
+// JNI callback for camera intrinsics
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onIntrinsicsAvailable(
+    JNIEnv* env, jclass clazz,
+    jfloat fx, jfloat fy, jfloat cx, jfloat cy,
+    jfloat skew, jint width, jint height)
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    GCameraFx = fx;
+    GCameraFy = fy;
+    GCameraCx = cx;
+    GCameraCy = cy;
+    GCameraSkew = skew;
+    GCameraCalibWidth = width;
+    GCameraCalibHeight = height;
+    UE_LOG(LogSimpleCamera2, Log, TEXT("Intrinsics received: fx=%.2f fy=%.2f cx=%.2f cy=%.2f skew=%.4f res=%dx%d"),
+        fx, fy, cx, cy, skew, width, height);
+}
+
+// JNI callback for lens distortion coefficients
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onDistortionAvailable(
+    JNIEnv* env, jclass clazz, jfloatArray coeffs, jint length)
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    GLensDistortionCoeffs.Empty();
+    if (coeffs && length > 0)
+    {
+        jfloat* data = env->GetFloatArrayElements(coeffs, nullptr);
+        for (int i = 0; i < length; i++)
+        {
+            GLensDistortionCoeffs.Add(data[i]);
+        }
+        env->ReleaseFloatArrayElements(coeffs, data, JNI_ABORT);
+        UE_LOG(LogSimpleCamera2, Log, TEXT("Distortion coefficients received: %d values"), length);
+    }
+}
+
+// JNI callback for original resolution
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onOriginalResolutionAvailable(
+    JNIEnv* env, jclass clazz, jint width, jint height)
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    GOriginalResolutionWidth = width;
+    GOriginalResolutionHeight = height;
+    UE_LOG(LogSimpleCamera2, Log, TEXT("Original resolution: %dx%d"), width, height);
+}
+
+// JNI callback for pixel array size
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onPixelArraySizeAvailable(
+    JNIEnv* env, jclass clazz, jint width, jint height)
+{
+    UE_LOG(LogSimpleCamera2, Log, TEXT("Pixel array size: %dx%d"), width, height);
+}
+
+// JNI callback for active array size
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onActiveArraySizeAvailable(
+    JNIEnv* env, jclass clazz, jint width, jint height)
+{
+    UE_LOG(LogSimpleCamera2, Log, TEXT("Active array size: %dx%d"), width, height);
+}
+
+// JNI callback for camera characteristics JSON dump
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onCharacteristicsDumpAvailable(
+    JNIEnv* env, jclass clazz, jstring json)
+{
+    if (json)
+    {
+        const char* jsonChars = env->GetStringUTFChars(json, nullptr);
+        {
+            FScopeLock Lock(&GCameraIntrinsicsMutex);
+            GCameraCharacteristicsJson = FString(UTF8_TO_TCHAR(jsonChars));
+        }
+        env->ReleaseStringUTFChars(json, jsonChars);
+        UE_LOG(LogSimpleCamera2, Log, TEXT("Camera characteristics JSON received: %d chars"), GCameraCharacteristicsJson.Len());
+    }
+}
+
+// JNI callback for ZXing QR detection (finder pattern centers)
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onQrDetected(
+    JNIEnv* env, jclass clazz, jfloatArray points3, jfloat moduleSize, jint dimension, jlong timestampMs)
+{
+    if (!points3)
+    {
+        return;
+    }
+    jsize len = env->GetArrayLength(points3);
+    if (len < 6)
+    {
+        return;
+    }
+    jfloat* data = env->GetFloatArrayElements(points3, nullptr);
+    if (!data)
+    {
+        return;
+    }
+
+    {
+        FScopeLock Lock(&GQrMutex);
+        GQrBottomLeft = FVector2D(data[0], data[1]);
+        GQrTopLeft = FVector2D(data[2], data[3]);
+        GQrTopRight = FVector2D(data[4], data[5]);
+        GQrModuleSize = moduleSize;
+        GQrDimension = dimension;
+        GQrTimestampMs = static_cast<int64>(timestampMs);
+        GQrHasDetection = true;
+    }
+
+    env->ReleaseFloatArrayElements(points3, data, JNI_ABORT);
+
+    UE_LOG(LogSimpleCamera2, Verbose, TEXT("QR detected via ZXing: module=%.3f dim=%d ts=%lld"),
+        moduleSize, dimension, (long long)timestampMs);
 }
 #endif
 
@@ -171,8 +315,8 @@ bool USimpleCamera2Test::StartCameraPreview()
     UE_LOG(LogSimpleCamera2, Warning, TEXT("=== CHECKING CAMERA TEXTURE ==="));
     if (!CameraTexture)
     {
-        UE_LOG(LogSimpleCamera2, Warning, TEXT("Creating new camera texture 800x600"));
-        CameraTexture = UTexture2D::CreateTransient(800, 600, PF_B8G8R8A8);
+        UE_LOG(LogSimpleCamera2, Warning, TEXT("Creating new camera texture 1280x960"));
+        CameraTexture = UTexture2D::CreateTransient(1280, 960, PF_B8G8R8A8);
         if (CameraTexture)
         {
             UE_LOG(LogSimpleCamera2, Warning, TEXT("Camera texture created successfully"));
@@ -181,7 +325,7 @@ bool USimpleCamera2Test::StartCameraPreview()
             // Initialize with dark pattern to show it's waiting for camera
             FTexture2DMipMap& Mip = CameraTexture->GetPlatformData()->Mips[0];
             void* TextureData = Mip.BulkData.Lock(LOCK_READ_WRITE);
-            FMemory::Memset(TextureData, 64, 800 * 600 * 4); // Dark gray
+            FMemory::Memset(TextureData, 64, 1280 * 960 * 4); // Dark gray
             Mip.BulkData.Unlock();
             CameraTexture->UpdateResource();
         }
@@ -375,4 +519,114 @@ void USimpleCamera2Test::StopCameraPreview()
 UTexture2D* USimpleCamera2Test::GetCameraTexture()
 {
     return CameraTexture;
+}
+
+// ===== Camera Intrinsics Getters =====
+
+float USimpleCamera2Test::GetCameraFx()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return GCameraFx;
+}
+
+float USimpleCamera2Test::GetCameraFy()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return GCameraFy;
+}
+
+FVector2D USimpleCamera2Test::GetPrincipalPoint()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return FVector2D(GCameraCx, GCameraCy);
+}
+
+float USimpleCamera2Test::GetCameraSkew()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return GCameraSkew;
+}
+
+FIntPoint USimpleCamera2Test::GetCalibrationResolution()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return FIntPoint(GCameraCalibWidth, GCameraCalibHeight);
+}
+
+TArray<float> USimpleCamera2Test::GetLensDistortion()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return GLensDistortionCoeffs;
+}
+
+FIntPoint USimpleCamera2Test::GetOriginalResolution()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    return FIntPoint(GOriginalResolutionWidth, GOriginalResolutionHeight);
+}
+
+TArray<float> USimpleCamera2Test::GetLensDistortionUE()
+{
+    FScopeLock Lock(&GCameraIntrinsicsMutex);
+    // UE format: [K1, K2, P1, P2, K3, K4, K5, K6]
+    TArray<float> UECoeffs;
+    UECoeffs.SetNum(8);
+    for (int i = 0; i < 8; i++)
+    {
+        UECoeffs[i] = 0.0f;
+    }
+
+    // Map from Brown model (k1, k2, p1, p2, k3) to UE format
+    if (GLensDistortionCoeffs.Num() >= 5)
+    {
+        UECoeffs[0] = GLensDistortionCoeffs[0]; // K1
+        UECoeffs[1] = GLensDistortionCoeffs[1]; // K2
+        UECoeffs[2] = GLensDistortionCoeffs[2]; // P1
+        UECoeffs[3] = GLensDistortionCoeffs[3]; // P2
+        UECoeffs[4] = GLensDistortionCoeffs[4]; // K3
+    }
+    else if (GLensDistortionCoeffs.Num() > 0)
+    {
+        // Copy whatever we have
+        for (int i = 0; i < FMath::Min(GLensDistortionCoeffs.Num(), 8); i++)
+        {
+            UECoeffs[i] = GLensDistortionCoeffs[i];
+        }
+    }
+
+    return UECoeffs;
+}
+
+FString USimpleCamera2Test::GetCameraCharacteristics()
+{
+    return GCameraCharacteristicsJson;
+}
+
+bool USimpleCamera2Test::GetLatestQrFinderDetection(
+    FVector2D& OutBottomLeft,
+    FVector2D& OutTopLeft,
+    FVector2D& OutTopRight,
+    float& OutModuleSize,
+    int32& OutDimensionModules,
+    int64& OutTimestampMs)
+{
+    FScopeLock Lock(&GQrMutex);
+    if (!GQrHasDetection)
+    {
+        OutBottomLeft = FVector2D::ZeroVector;
+        OutTopLeft = FVector2D::ZeroVector;
+        OutTopRight = FVector2D::ZeroVector;
+        OutModuleSize = 0.0f;
+        OutDimensionModules = 0;
+        OutTimestampMs = 0;
+        return false;
+    }
+
+    OutBottomLeft = GQrBottomLeft;
+    OutTopLeft = GQrTopLeft;
+    OutTopRight = GQrTopRight;
+    OutModuleSize = GQrModuleSize;
+    OutDimensionModules = GQrDimension;
+    OutTimestampMs = GQrTimestampMs;
+    return true;
 }

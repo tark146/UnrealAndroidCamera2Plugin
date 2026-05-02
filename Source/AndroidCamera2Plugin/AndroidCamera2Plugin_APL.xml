@@ -26,6 +26,9 @@
         <log text="BuildDir: $S(BuildDir)"/>
         <copyFile src="$S(PluginDir)/Android/src/com/epicgames/ue4/Camera2Helper.java"
                   dst="$S(BuildDir)/src/com/epicgames/ue4/Camera2Helper.java"/>
+        <!-- Copy ZXing jar into app/libs so Gradle can pick it up -->
+        <copyFile src="$S(PluginDir)/Source/ThirdParty/zxing-core-3.5.2.jar"
+                  dst="$S(BuildDir)/gradle/app/libs/zxing-core-3.5.2.jar"/>
         <log text="Camera2Helper.java copy attempted"/>
     </prebuildCopies>
     
@@ -34,6 +37,20 @@
         <copyFile src="$S(PluginDir)/Android/src/com/epicgames/ue4/Camera2Helper.java"
                   dst="$S(BuildDir)/src/com/epicgames/ue4/Camera2Helper.java"/>
     </sourceCopies>
+
+    <addJars>
+        <insert>
+            <!-- Point to the jar inside app/libs -->
+            <jarfile>$S(BuildDir)/gradle/app/libs/zxing-core-3.5.2.jar</jarfile>
+        </insert>
+    </addJars>
+
+    <!-- Ensure Gradle depends on the copied jar -->
+    <gradleDependencies>
+        <insert>
+            implementation files('libs/zxing-core-3.5.2.jar')
+        </insert>
+    </gradleDependencies>
 
     <!-- ProGuard rules to keep our classes -->
     <proguardAdditions>

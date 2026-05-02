@@ -17,6 +17,26 @@ import android.view.Surface;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import android.Manifest;
+import android.os.Environment;
+import android.util.SizeF;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.List;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.EnumMap;
+import java.util.Map;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.Result;
+import com.google.zxing.ResultMetadataType;
+import com.google.zxing.ResultPoint;
+import com.google.zxing.common.HybridBinarizer;
+import com.google.zxing.qrcode.QRCodeReader;
+import com.google.zxing.PlanarYUVLuminanceSource;
 
 public class Camera2Helper {
     private static final String TAG = "Camera2Helper";
@@ -33,16 +53,35 @@ public class Camera2Helper {
     
     // Frame data storage
     private byte[] latestFrameData;
-    private int frameWidth = 800;
-    private int frameHeight = 600;
+    private int frameWidth = 1280;
+    private int frameHeight = 960;
     private boolean isCapturing = false;
+    private boolean zxingEnabled = true;
     
-    // Native callback
+    // Native callbacks
     private static native void onFrameAvailable(byte[] data, int width, int height);
+    private static native void onIntrinsicsAvailable(float fx, float fy, float cx, float cy, float skew, int width, int height);
+    private static native void onDistortionAvailable(float[] coeffs, int length);
+    private static native void onOriginalResolutionAvailable(int width, int height);
+    private static native void onPixelArraySizeAvailable(int width, int height);
+    private static native void onActiveArraySizeAvailable(int width, int height);
+    private static native void onCharacteristicsDumpAvailable(String json);
+    private static native void onQrDetected(float[] finderPoints, float moduleSize, int dimension, long timestampMs);
+
+    // Camera intrinsics state
+    private String currentCameraId;
+    private String lastCharacteristicsDumpPath;
+    private String lastCharacteristicsDumpJson;
     
     private Camera2Helper(Context ctx) {
         this.context = ctx;
         this.cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+        try {
+            Class.forName("com.google.zxing.qrcode.QRCodeReader");
+        } catch (Throwable t) {
+            Log.w(TAG, "ZXing not found on classpath. QR decoding will be disabled.");
+            zxingEnabled = false;
+        }
     }
     
     public static Camera2Helper getInstance(Context ctx) {
@@ -199,7 +238,111 @@ public class Camera2Helper {
             } else {
                 Log.d(TAG, "Selected camera ID: " + cameraId);
             }
-            
+
+            // Store current camera ID for intrinsics queries
+            this.currentCameraId = cameraId;
+
+            // Query and send camera intrinsics
+            try {
+                CameraCharacteristics cc = cameraManager.getCameraCharacteristics(cameraId);
+                float[] intr = cc.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION);
+                float fx = 0, fy = 0, cx = 0, cy = 0, skew = 0;
+                if (intr != null && intr.length >= 4) {
+                    fx = intr[0]; fy = intr[1]; cx = intr[2]; cy = intr[3];
+                    if (intr.length >= 5) { skew = intr[4]; }
+                    Log.d(TAG, "Intrinsics found: fx="+fx+" fy="+fy+" cx="+cx+" cy="+cy+" skew="+skew);
+                } else {
+                    Log.w(TAG, "LENS_INTRINSIC_CALIBRATION not available or too short");
+                }
+
+                // Fallback: derive intrinsics from focal length and sensor size
+                float[] focalLengthsMm = cc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+                SizeF sensorSizeMm = cc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+                Integer pixelArrayW = cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) != null ?
+                        cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE).getWidth() : null;
+                Integer pixelArrayH = cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) != null ?
+                        cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE).getHeight() : null;
+                if ((fx == 0 || fy == 0) && focalLengthsMm != null && focalLengthsMm.length > 0 && sensorSizeMm != null && pixelArrayW != null && pixelArrayH != null) {
+                    float pixelsPerMmX = pixelArrayW / sensorSizeMm.getWidth();
+                    float pixelsPerMmY = pixelArrayH / sensorSizeMm.getHeight();
+                    fx = focalLengthsMm[0] * pixelsPerMmX;
+                    fy = focalLengthsMm[0] * pixelsPerMmY;
+                    cx = pixelArrayW * 0.5f;
+                    cy = pixelArrayH * 0.5f;
+                    Log.d(TAG, "Derived intrinsics from focal length: fx="+fx+" fy="+fy+" cx="+cx+" cy="+cy);
+                }
+
+                // Get original sensor resolution
+                int srcW = 0, srcH = 0;
+                try {
+                    android.util.Size pixelArray = cc.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+                    if (pixelArray != null) {
+                        srcW = pixelArray.getWidth();
+                        srcH = pixelArray.getHeight();
+                        Log.d(TAG, "Pixel array size: " + srcW + "x" + srcH);
+                        onPixelArraySizeAvailable(srcW, srcH);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "SENSOR_INFO_PIXEL_ARRAY_SIZE unavailable: " + e.getMessage());
+                }
+
+                if (srcW == 0 || srcH == 0) {
+                    try {
+                        android.graphics.Rect active = cc.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                        if (active != null) {
+                            srcW = active.width();
+                            srcH = active.height();
+                            Log.d(TAG, "Active array size: " + srcW + "x" + srcH);
+                            onActiveArraySizeAvailable(srcW, srcH);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "ACTIVE_ARRAY_SIZE unavailable: " + e.getMessage());
+                    }
+                }
+
+                if (srcW > 0 && srcH > 0) {
+                    onOriginalResolutionAvailable(srcW, srcH);
+                }
+
+                // Get distortion coefficients
+                float[] lensDist = null;
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        lensDist = cc.get(CameraCharacteristics.LENS_DISTORTION);
+                        if (lensDist != null) {
+                            Log.d(TAG, "Using LENS_DISTORTION, length=" + lensDist.length);
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "LENS_DISTORTION unavailable: " + e.getMessage());
+                }
+
+                if (lensDist == null) {
+                    try {
+                        lensDist = cc.get(CameraCharacteristics.LENS_RADIAL_DISTORTION);
+                        if (lensDist != null) {
+                            Log.d(TAG, "Using LENS_RADIAL_DISTORTION, length=" + lensDist.length);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "LENS_RADIAL_DISTORTION unavailable: " + e.getMessage());
+                    }
+                }
+
+                if (lensDist != null && lensDist.length > 0) {
+                    Log.d(TAG, "Distortion coefficients: " + lensDist.length + " values");
+                    onDistortionAvailable(lensDist, lensDist.length);
+                } else {
+                    Log.d(TAG, "No distortion coefficients available, sending empty array");
+                    onDistortionAvailable(new float[0], 0);
+                }
+
+                // Send intrinsics to native side
+                onIntrinsicsAvailable(fx, fy, cx, cy, skew, frameWidth, frameHeight);
+
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to get intrinsics: " + e.getMessage());
+            }
+
             // Setup ImageReader for camera frames
             Log.d(TAG, "Creating ImageReader " + frameWidth + "x" + frameHeight);
             imageReader = ImageReader.newInstance(frameWidth, frameHeight, 
@@ -212,10 +355,14 @@ public class Camera2Helper {
                 public void onImageAvailable(ImageReader reader) {
                     Image image = null;
                     try {
-                        image = reader.acquireLatestImage();
-                        if (image != null) {
-                            processImage(image);
+                    image = reader.acquireLatestImage();
+                    if (image != null) {
+                        // Normal mode: QR decode + full color path
+                        if (zxingEnabled) {
+                            processQr(image);
                         }
+                        processImage(image);
+                    }
                     } catch (Exception e) {
                         Log.e(TAG, "Error processing image: " + e.getMessage());
                     } finally {
@@ -327,18 +474,24 @@ public class Camera2Helper {
                 
                 // Extract Y data (full resolution)
                 ByteBuffer yBuffer = yPlane.getBuffer();
+                if (yBuffer == null) { processImageGrayscale(image); return; }
+                yBuffer.rewind();
                 int ySize = yBuffer.remaining();
                 byte[] yData = new byte[ySize];
                 yBuffer.get(yData);
                 
                 // Extract U data (usually half resolution)
                 ByteBuffer uBuffer = uPlane.getBuffer();
+                if (uBuffer == null) { processImageGrayscale(image); return; }
+                uBuffer.rewind();
                 int uSize = uBuffer.remaining();
                 byte[] uData = new byte[uSize];
                 uBuffer.get(uData);
                 
                 // Extract V data (usually half resolution)
                 ByteBuffer vBuffer = vPlane.getBuffer();
+                if (vBuffer == null) { processImageGrayscale(image); return; }
+                vBuffer.rewind();
                 int vSize = vBuffer.remaining();
                 byte[] vData = new byte[vSize];
                 vBuffer.get(vData);
@@ -358,7 +511,7 @@ public class Camera2Helper {
                 if (rgbaData != null) {
                     latestFrameData = rgbaData;
                     Log.v(TAG, "Sending full color RGBA data to native: size=" + rgbaData.length);
-                    onFrameAvailable(rgbaData, frameWidth, frameHeight);
+                    onFrameAvailable(rgbaData, imageWidth, imageHeight);
                 }
             } else {
                 Log.w(TAG, "Not enough planes for color processing (got " + planes.length + "), falling back to grayscale");
@@ -378,6 +531,10 @@ public class Camera2Helper {
             if (planes.length > 0) {
                 Image.Plane yPlane = planes[0];
                 ByteBuffer yBuffer = yPlane.getBuffer();
+                if (yBuffer == null) {
+                    return;
+                }
+                yBuffer.rewind(); // ensure position at start (QR pass may have consumed)
                 
                 int imageWidth = image.getWidth();
                 int imageHeight = image.getHeight();
@@ -548,6 +705,86 @@ public class Camera2Helper {
         
         return rgba;
     }
+
+    // ZXing QR decode on Y plane
+    private void processQr(Image image) {
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            if (planes == null || planes.length == 0) {
+                return;
+            }
+            Image.Plane yPlane = planes[0];
+            ByteBuffer yBuffer = yPlane.getBuffer();
+            if (yBuffer == null) {
+                return;
+            }
+            // Ensure position is at start (processImage may have read it before)
+            yBuffer.rewind();
+            int imageWidth = image.getWidth();
+            int imageHeight = image.getHeight();
+            int rowStride = yPlane.getRowStride();
+            int pixelStride = yPlane.getPixelStride();
+
+            byte[] yData = new byte[imageWidth * imageHeight];
+            if (pixelStride == 1 && rowStride == imageWidth) {
+                yBuffer.get(yData);
+            } else {
+                byte[] rowData = new byte[rowStride];
+                for (int row = 0; row < imageHeight; row++) {
+                    if (yBuffer.remaining() < rowStride) break;
+                    yBuffer.get(rowData, 0, rowStride);
+                    for (int col = 0; col < imageWidth; col++) {
+                        yData[row * imageWidth + col] = rowData[col * pixelStride];
+                    }
+                }
+            }
+
+            PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
+                    yData, imageWidth, imageHeight,
+                    0, 0, imageWidth, imageHeight,
+                    false);
+            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
+
+            Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+            hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+
+            QRCodeReader reader = new QRCodeReader();
+            Result result = reader.decode(bitmap, hints);
+            if (result == null) {
+                return;
+            }
+
+            ResultPoint[] pts = result.getResultPoints();
+            if (pts == null || pts.length < 3) {
+                return;
+            }
+
+            // ZXing order is typically: bottom-left, top-left, top-right
+            float[] finderPoints = new float[6];
+            finderPoints[0] = pts[0].getX();
+            finderPoints[1] = pts[0].getY();
+            finderPoints[2] = pts[1].getX();
+            finderPoints[3] = pts[1].getY();
+            finderPoints[4] = pts[2].getX();
+            finderPoints[5] = pts[2].getY();
+
+            int dimension = 0; // DIMENSION metadata is not available in current ZXing; leave as 0
+
+            float moduleSize = 0.0f;
+            if (dimension > 7) {
+                double spanX = Math.hypot(pts[2].getX() - pts[1].getX(), pts[2].getY() - pts[1].getY());
+                double spanY = Math.hypot(pts[0].getX() - pts[1].getX(), pts[0].getY() - pts[1].getY());
+                moduleSize = (float) ((spanX + spanY) * 0.5 / (dimension - 7));
+            }
+
+            long timestampMs = image.getTimestamp() > 0 ? image.getTimestamp() / 1_000_000L : System.nanoTime() / 1_000_000L;
+            onQrDetected(finderPoints, moduleSize, dimension, timestampMs);
+        } catch (com.google.zxing.NotFoundException nf) {
+            // no QR in frame
+        } catch (Throwable t) {
+            Log.w(TAG, "ZXing decode failed: " + (t != null ? t.getMessage() : "unknown"));
+        }
+    }
     
     public void stopCamera() {
         isCapturing = false;
@@ -602,5 +839,234 @@ public class Camera2Helper {
     // Method to request permission (callable from C++)
     public void requestPermission() {
         requestCameraPermission();
+    }
+
+    // ===== Camera Characteristics Dump =====
+
+    // Inner class for scaled intrinsics
+    private static class Intr {
+        float fx, fy, cx, cy;
+    }
+
+    // Center crop calculation for aspect ratio adjustment
+    private static android.graphics.Rect centerCrop(int srcW, int srcH, int dstW, int dstH) {
+        float srcAspect = (float) srcW / (float) srcH;
+        float dstAspect = (float) dstW / (float) dstH;
+        if (dstAspect > srcAspect) {
+            // Wider output: crop height
+            int cropH = Math.round(srcW / dstAspect);
+            int top = (srcH - cropH) / 2;
+            return new android.graphics.Rect(0, top, srcW, top + cropH);
+        } else {
+            // Taller output: crop width
+            int cropW = Math.round(srcH * dstAspect);
+            int left = (srcW - cropW) / 2;
+            return new android.graphics.Rect(left, 0, left + cropW, srcH);
+        }
+    }
+
+    // Scale intrinsics for stream resolution
+    private static Intr intrinsicsForStream(float fx, float fy, float cx, float cy,
+                                            int sensorW, int sensorH, int outW, int outH) {
+        android.graphics.Rect crop = centerCrop(sensorW, sensorH, outW, outH);
+        float sx = (float) outW / (float) crop.width();
+        float sy = (float) outH / (float) crop.height();
+        Intr k = new Intr();
+        k.fx = fx * sx;
+        k.fy = fy * sy;
+        k.cx = (cx - crop.left) * sx;
+        k.cy = (cy - crop.top) * sy;
+        return k;
+    }
+
+    // Dump all CameraCharacteristics to JSON and send to native
+    public void dumpCameraCharacteristics() {
+        try {
+            if (cameraManager == null) {
+                Log.e(TAG, "cameraManager is null; cannot dump characteristics");
+                return;
+            }
+            String id = currentCameraId;
+            if (id == null) {
+                String[] ids = cameraManager.getCameraIdList();
+                if (ids != null && ids.length > 0) {
+                    id = ids[0];
+                }
+            }
+            if (id == null) {
+                Log.e(TAG, "No cameraId available for dump");
+                return;
+            }
+
+            CameraCharacteristics cc = cameraManager.getCameraCharacteristics(id);
+            JSONObject root = new JSONObject();
+            root.put("cameraId", id);
+            root.put("sdk", Build.VERSION.SDK_INT);
+
+            JSONObject values = new JSONObject();
+            boolean dumpedAny = false;
+
+            // Try getKeys() method
+            try {
+                Method getKeysMethod = CameraCharacteristics.class.getMethod("getKeys");
+                @SuppressWarnings("unchecked")
+                List<CameraCharacteristics.Key<?>> keys = (List<CameraCharacteristics.Key<?>>) getKeysMethod.invoke(cc);
+                if (keys != null) {
+                    for (CameraCharacteristics.Key<?> key : keys) {
+                        String keyName = getKeyName(key);
+                        Object val = safeGet(cc, key);
+                        values.put(keyName, toJsonValue(val));
+                        dumpedAny = true;
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "getKeys() unavailable; will use reflection fallback: " + t.getMessage());
+            }
+
+            // Reflection fallback
+            if (!dumpedAny) {
+                for (Field f : CameraCharacteristics.class.getFields()) {
+                    try {
+                        if (CameraCharacteristics.Key.class.isAssignableFrom(f.getType())) {
+                            @SuppressWarnings("unchecked")
+                            CameraCharacteristics.Key<?> key = (CameraCharacteristics.Key<?>) f.get(null);
+                            if (key != null) {
+                                String keyName = f.getName();
+                                Object val = safeGet(cc, key);
+                                values.put(keyName, toJsonValue(val));
+                            }
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }
+
+            root.put("values", values);
+            String json = root.toString();
+            Log.d(TAG, "Dumped CameraCharacteristics JSON length=" + json.length());
+            lastCharacteristicsDumpJson = json;
+
+            // Save to file
+            try {
+                String fileName = "camera_characteristics_" + id + ".json";
+                saveJsonToFile(fileName, json);
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to save characteristics JSON to file: " + e.getMessage());
+            }
+
+            onCharacteristicsDumpAvailable(json);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to dump CameraCharacteristics: " + e.getMessage());
+        }
+    }
+
+    private static Object safeGet(CameraCharacteristics cc, CameraCharacteristics.Key<?> key) {
+        try {
+            @SuppressWarnings("unchecked")
+            Object val = cc.get((CameraCharacteristics.Key<Object>) key);
+            return val;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String getKeyName(CameraCharacteristics.Key<?> key) {
+        try {
+            Method m = key.getClass().getMethod("getName");
+            m.setAccessible(true);
+            Object name = m.invoke(key);
+            if (name != null) return name.toString();
+        } catch (Throwable ignored) { }
+        try {
+            String s = key.toString();
+            return s != null ? s : "<unknown>";
+        } catch (Throwable t) {
+            return "<unknown>";
+        }
+    }
+
+    private static Object toJsonValue(Object val) {
+        if (val == null) return JSONObject.NULL;
+        if (val instanceof Number || val instanceof Boolean || val instanceof String) return val;
+        if (val instanceof android.util.Size) {
+            android.util.Size s = (android.util.Size) val;
+            JSONObject o = new JSONObject();
+            try { o.put("width", s.getWidth()); o.put("height", s.getHeight()); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val instanceof android.graphics.Rect) {
+            android.graphics.Rect r = (android.graphics.Rect) val;
+            JSONObject o = new JSONObject();
+            try { o.put("left", r.left); o.put("top", r.top); o.put("right", r.right); o.put("bottom", r.bottom); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val instanceof android.util.Range) {
+            android.util.Range<?> r = (android.util.Range<?>) val;
+            JSONObject o = new JSONObject();
+            try { o.put("lower", String.valueOf(r.getLower())); o.put("upper", String.valueOf(r.getUpper())); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val instanceof SizeF) {
+            SizeF s = (SizeF) val;
+            JSONObject o = new JSONObject();
+            try { o.put("width", s.getWidth()); o.put("height", s.getHeight()); } catch (Exception ignored) {}
+            return o;
+        }
+        if (val.getClass().isArray()) {
+            JSONArray arr = new JSONArray();
+            int len = java.lang.reflect.Array.getLength(val);
+            for (int i = 0; i < len; i++) {
+                Object e = java.lang.reflect.Array.get(val, i);
+                arr.put(toJsonValue(e));
+            }
+            return arr;
+        }
+        if (val instanceof java.util.Collection) {
+            JSONArray arr = new JSONArray();
+            for (Object e : (java.util.Collection<?>) val) arr.put(toJsonValue(e));
+            return arr;
+        }
+        return String.valueOf(val);
+    }
+
+    private void saveJsonToFile(String fileName, String jsonContent) {
+        File baseDir = null;
+        try {
+            // Use getExternalFilesDir for safe storage (no permission required)
+            baseDir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
+            if (baseDir == null) {
+                baseDir = context.getExternalFilesDir(null);
+            }
+            if (baseDir == null) {
+                baseDir = context.getFilesDir();
+            }
+            File outDir = new File(baseDir, "Camera2");
+            if (!outDir.exists()) {
+                outDir.mkdirs();
+            }
+            File outFile = new File(outDir, fileName);
+            try (FileOutputStream fos = new FileOutputStream(outFile, false)) {
+                byte[] bytes = jsonContent.getBytes(StandardCharsets.UTF_8);
+                fos.write(bytes);
+                fos.flush();
+            }
+            lastCharacteristicsDumpPath = outFile.getAbsolutePath();
+            Log.i(TAG, "CameraCharacteristics JSON saved: " + outFile.getAbsolutePath());
+        } catch (Throwable t) {
+            Log.w(TAG, "Error saving JSON to file: " + t.getMessage());
+        }
+    }
+
+    // Public getters for dump results
+    public String getLastCharacteristicsDumpPath() {
+        return lastCharacteristicsDumpPath != null ? lastCharacteristicsDumpPath : "";
+    }
+
+    public String getLastCharacteristicsDumpJson() {
+        return lastCharacteristicsDumpJson != null ? lastCharacteristicsDumpJson : "";
+    }
+
+    public String dumpCameraCharacteristicsAndReturnPath() {
+        dumpCameraCharacteristics();
+        return getLastCharacteristicsDumpPath();
     }
 }
