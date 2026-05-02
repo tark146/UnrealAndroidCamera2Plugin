@@ -68,7 +68,7 @@ public class Camera2Helper {
     private static native void onCharacteristicsDumpAvailable(String json);
     private static native void onCameraSelected(String cameraId, boolean isLeftCamera);
     private static native void onCameraPoseAvailable(float tx, float ty, float tz, float qx, float qy, float qz, float qw);
-    private static native void onQrDetected(float[] finderPoints, float moduleSize, int dimension, long timestampMs);
+    private static native void onQrDetected(float[] finderPoints, float moduleSize, int dimension, long timestampMs, String text);
 
     private Camera2Helper(Context ctx) {
         this.context = ctx;
@@ -1097,7 +1097,9 @@ public class Camera2Helper {
             }
 
             long timestampMs = image.getTimestamp() > 0 ? image.getTimestamp() / 1_000_000L : System.nanoTime() / 1_000_000L;
-            onQrDetected(finderPoints, moduleSize, dimension, timestampMs);
+            String qrText = result.getText();
+            if (qrText == null) qrText = "";
+            onQrDetected(finderPoints, moduleSize, dimension, timestampMs, qrText);
         } catch (com.google.zxing.NotFoundException nf) {
             // no QR in frame
         } catch (Throwable t) {

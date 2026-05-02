@@ -66,6 +66,7 @@ static float GQrModuleSize = 0.0f;
 static int32 GQrDimension = 0;
 static int64 GQrTimestampMs = 0;
 static bool GQrHasDetection = false;
+static FString GQrText;
 static FCriticalSection GQrMutex;
 
 // =============================================================================
@@ -665,10 +666,10 @@ Java_com_epicgames_ue4_Camera2Helper_onCameraPoseAvailable(JNIEnv* env, jclass c
     }
 }
 
-// JNI callback for ZXing QR detection (finder pattern centers)
+// JNI callback for ZXing QR detection (finder pattern centers + decoded text)
 extern "C" JNIEXPORT void JNICALL
 Java_com_epicgames_ue4_Camera2Helper_onQrDetected(
-    JNIEnv* env, jclass clazz, jfloatArray points3, jfloat moduleSize, jint dimension, jlong timestampMs)
+    JNIEnv* env, jclass clazz, jfloatArray points3, jfloat moduleSize, jint dimension, jlong timestampMs, jstring text)
 {
     if (!points3)
     {
@@ -687,6 +688,17 @@ Java_com_epicgames_ue4_Camera2Helper_onQrDetected(
         return;
     }
 
+    FString DecodedText;
+    if (text)
+    {
+        const char* utf = env->GetStringUTFChars(text, nullptr);
+        if (utf)
+        {
+            DecodedText = FString(UTF8_TO_TCHAR(utf));
+            env->ReleaseStringUTFChars(text, utf);
+        }
+    }
+
     {
         FScopeLock Lock(&GQrMutex);
         GQrBottomLeft = FVector2D(data[0], data[1]);
@@ -695,13 +707,14 @@ Java_com_epicgames_ue4_Camera2Helper_onQrDetected(
         GQrModuleSize = moduleSize;
         GQrDimension = dimension;
         GQrTimestampMs = static_cast<int64>(timestampMs);
+        GQrText = DecodedText;
         GQrHasDetection = true;
     }
 
     env->ReleaseFloatArrayElements(points3, data, JNI_ABORT);
 
-    UE_LOG(LogSimpleCamera2, Verbose, TEXT("QR detected via ZXing: module=%.3f dim=%d ts=%lld"),
-        moduleSize, dimension, (long long)timestampMs);
+    UE_LOG(LogSimpleCamera2, Verbose, TEXT("QR detected via ZXing: text='%s' module=%.3f dim=%d ts=%lld"),
+        *DecodedText, moduleSize, dimension, (long long)timestampMs);
 }
 #endif
 
@@ -1756,4 +1769,19 @@ bool USimpleCamera2Test::GetLatestQrFinderDetection(
     OutDimensionModules = GQrDimension;
     OutTimestampMs = GQrTimestampMs;
     return true;
+}
+
+bool USimpleCamera2Test::GetLatestQrText(FString& OutText, int64& OutTimestampMs)
+{
+    FScopeLock Lock(&GQrMutex);
+    if (!GQrHasDetection)
+    {
+        OutText = FString();
+        OutTimestampMs = 0;
+        return false;
+    }
+
+    OutText = GQrText;
+    OutTimestampMs = GQrTimestampMs;
+    return !OutText.IsEmpty();
 }

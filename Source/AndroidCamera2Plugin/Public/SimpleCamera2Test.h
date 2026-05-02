@@ -247,4 +247,8 @@ public:
         int32& OutDimensionModules,
         int64& OutTimestampMs);
 
+    /** Decoded text content of the last detected QR (ZXing) */
+    UFUNCTION(BlueprintCallable, Category = "Camera2|QR")
+    static bool GetLatestQrText(FString& OutText, int64& OutTimestampMs);
+
 };
