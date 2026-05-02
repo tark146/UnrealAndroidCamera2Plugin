@@ -27,6 +27,16 @@ import java.util.List;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.EnumMap;
+import java.util.Map;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.Result;
+import com.google.zxing.ResultMetadataType;
+import com.google.zxing.ResultPoint;
+import com.google.zxing.common.HybridBinarizer;
+import com.google.zxing.qrcode.QRCodeReader;
+import com.google.zxing.PlanarYUVLuminanceSource;
 
 public class Camera2Helper {
     private static final String TAG = "Camera2Helper";
@@ -46,7 +56,8 @@ public class Camera2Helper {
     private int frameWidth = 1280;
     private int frameHeight = 960;
     private boolean isCapturing = false;
-    
+    private boolean zxingEnabled = true;
+
     // Native callback
     private static native void onFrameAvailable(byte[] data, int width, int height);
     private static native void onIntrinsicsAvailable(float fx, float fy, float cx, float cy, float skew, int width, int height);
@@ -57,10 +68,17 @@ public class Camera2Helper {
     private static native void onCharacteristicsDumpAvailable(String json);
     private static native void onCameraSelected(String cameraId, boolean isLeftCamera);
     private static native void onCameraPoseAvailable(float tx, float ty, float tz, float qx, float qy, float qz, float qw);
-    
+    private static native void onQrDetected(float[] finderPoints, float moduleSize, int dimension, long timestampMs);
+
     private Camera2Helper(Context ctx) {
         this.context = ctx;
         this.cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+        try {
+            Class.forName("com.google.zxing.qrcode.QRCodeReader");
+        } catch (Throwable t) {
+            Log.w(TAG, "ZXing not found on classpath. QR decoding will be disabled.");
+            zxingEnabled = false;
+        }
     }
     
     public static Camera2Helper getInstance(Context ctx) {
@@ -408,6 +426,9 @@ public class Camera2Helper {
                     try {
                         image = reader.acquireLatestImage();
                         if (image != null) {
+                            if (zxingEnabled) {
+                                processQr(image);
+                            }
                             processImage(image);
                         }
                     } catch (Exception e) {
@@ -1000,10 +1021,90 @@ public class Camera2Helper {
                 rgba[i * 4 + 3] = (byte)255; // A = 255
             }
         }
-        
+
         return rgba;
     }
-    
+
+    // ZXing QR decode on Y plane
+    private void processQr(Image image) {
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            if (planes == null || planes.length == 0) {
+                return;
+            }
+            Image.Plane yPlane = planes[0];
+            ByteBuffer yBuffer = yPlane.getBuffer();
+            if (yBuffer == null) {
+                return;
+            }
+            // Ensure position is at start (processImage may have read it before)
+            yBuffer.rewind();
+            int imageWidth = image.getWidth();
+            int imageHeight = image.getHeight();
+            int rowStride = yPlane.getRowStride();
+            int pixelStride = yPlane.getPixelStride();
+
+            byte[] yData = new byte[imageWidth * imageHeight];
+            if (pixelStride == 1 && rowStride == imageWidth) {
+                yBuffer.get(yData);
+            } else {
+                byte[] rowData = new byte[rowStride];
+                for (int row = 0; row < imageHeight; row++) {
+                    if (yBuffer.remaining() < rowStride) break;
+                    yBuffer.get(rowData, 0, rowStride);
+                    for (int col = 0; col < imageWidth; col++) {
+                        yData[row * imageWidth + col] = rowData[col * pixelStride];
+                    }
+                }
+            }
+
+            PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
+                    yData, imageWidth, imageHeight,
+                    0, 0, imageWidth, imageHeight,
+                    false);
+            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
+
+            Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+            hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+
+            QRCodeReader reader = new QRCodeReader();
+            Result result = reader.decode(bitmap, hints);
+            if (result == null) {
+                return;
+            }
+
+            ResultPoint[] pts = result.getResultPoints();
+            if (pts == null || pts.length < 3) {
+                return;
+            }
+
+            // ZXing order is typically: bottom-left, top-left, top-right
+            float[] finderPoints = new float[6];
+            finderPoints[0] = pts[0].getX();
+            finderPoints[1] = pts[0].getY();
+            finderPoints[2] = pts[1].getX();
+            finderPoints[3] = pts[1].getY();
+            finderPoints[4] = pts[2].getX();
+            finderPoints[5] = pts[2].getY();
+
+            int dimension = 0; // DIMENSION metadata is not available in current ZXing; leave as 0
+
+            float moduleSize = 0.0f;
+            if (dimension > 7) {
+                double spanX = Math.hypot(pts[2].getX() - pts[1].getX(), pts[2].getY() - pts[1].getY());
+                double spanY = Math.hypot(pts[0].getX() - pts[1].getX(), pts[0].getY() - pts[1].getY());
+                moduleSize = (float) ((spanX + spanY) * 0.5 / (dimension - 7));
+            }
+
+            long timestampMs = image.getTimestamp() > 0 ? image.getTimestamp() / 1_000_000L : System.nanoTime() / 1_000_000L;
+            onQrDetected(finderPoints, moduleSize, dimension, timestampMs);
+        } catch (com.google.zxing.NotFoundException nf) {
+            // no QR in frame
+        } catch (Throwable t) {
+            Log.w(TAG, "ZXing decode failed: " + (t != null ? t.getMessage() : "unknown"));
+        }
+    }
+
     public void stopCamera() {
         isCapturing = false;
         

@@ -234,5 +234,17 @@ public:
      */
     UFUNCTION(BlueprintCallable, Category = "Camera2|Diagnostics")
     static void IsRuntimeCalibrationAvailable(bool& bOutHasIntrinsics, bool& bOutHasPose);
-    
+
+    // ===== QR Detection (ZXing) =====
+
+    /** Last detected QR finder patterns (ZXing): bottom-left, top-left, top-right centers */
+    UFUNCTION(BlueprintCallable, Category = "Camera2|QR")
+    static bool GetLatestQrFinderDetection(
+        FVector2D& OutBottomLeft,
+        FVector2D& OutTopLeft,
+        FVector2D& OutTopRight,
+        float& OutModuleSize,
+        int32& OutDimensionModules,
+        int64& OutTimestampMs);
+
 };

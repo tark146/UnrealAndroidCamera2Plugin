@@ -58,6 +58,16 @@ static bool GCameraPoseAvailable = false;
 // Camera preference (for next StartCameraPreview call)
 static bool GPreferLeftCamera = true;
 
+// QR finder detection (ZXing)
+static FVector2D GQrBottomLeft = FVector2D::ZeroVector;
+static FVector2D GQrTopLeft = FVector2D::ZeroVector;
+static FVector2D GQrTopRight = FVector2D::ZeroVector;
+static float GQrModuleSize = 0.0f;
+static int32 GQrDimension = 0;
+static int64 GQrTimestampMs = 0;
+static bool GQrHasDetection = false;
+static FCriticalSection GQrMutex;
+
 // =============================================================================
 // QUEST 3 HARDCODED CALIBRATION DATA
 // Extracted from actual Quest 3 device dumps - these are the reference values
@@ -650,9 +660,48 @@ Java_com_epicgames_ue4_Camera2Helper_onCameraPoseAvailable(JNIEnv* env, jclass c
     if (GEngine)
     {
         GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green,
-            FString::Printf(TEXT("CamInHmd: [%.1f, %.1f, %.1f] cm"), 
+            FString::Printf(TEXT("CamInHmd: [%.1f, %.1f, %.1f] cm"),
                 GCameraPoseTranslation.X, GCameraPoseTranslation.Y, GCameraPoseTranslation.Z));
     }
+}
+
+// JNI callback for ZXing QR detection (finder pattern centers)
+extern "C" JNIEXPORT void JNICALL
+Java_com_epicgames_ue4_Camera2Helper_onQrDetected(
+    JNIEnv* env, jclass clazz, jfloatArray points3, jfloat moduleSize, jint dimension, jlong timestampMs)
+{
+    if (!points3)
+    {
+        return;
+    }
+
+    const jsize Length = env->GetArrayLength(points3);
+    if (Length < 6)
+    {
+        return;
+    }
+
+    jfloat* data = env->GetFloatArrayElements(points3, nullptr);
+    if (!data)
+    {
+        return;
+    }
+
+    {
+        FScopeLock Lock(&GQrMutex);
+        GQrBottomLeft = FVector2D(data[0], data[1]);
+        GQrTopLeft = FVector2D(data[2], data[3]);
+        GQrTopRight = FVector2D(data[4], data[5]);
+        GQrModuleSize = moduleSize;
+        GQrDimension = dimension;
+        GQrTimestampMs = static_cast<int64>(timestampMs);
+        GQrHasDetection = true;
+    }
+
+    env->ReleaseFloatArrayElements(points3, data, JNI_ABORT);
+
+    UE_LOG(LogSimpleCamera2, Verbose, TEXT("QR detected via ZXing: module=%.3f dim=%d ts=%lld"),
+        moduleSize, dimension, (long long)timestampMs);
 }
 #endif
 
@@ -1672,10 +1721,39 @@ FString USimpleCamera2Test::GetCalibrationDiagnostics(bool bLeftCamera)
     
     // WHAT'S ACTUALLY BEING USED
     Result += TEXT("\n--- CURRENTLY ACTIVE ---\n");
-    Result += FString::Printf(TEXT("Intrinsics source: %s\n"), 
+    Result += FString::Printf(TEXT("Intrinsics source: %s\n"),
         bHaveRuntimeIntrinsics ? TEXT("RUNTIME (from device)") : TEXT("HARDCODED (reference values)"));
-    Result += FString::Printf(TEXT("Pose source: %s\n"), 
+    Result += FString::Printf(TEXT("Pose source: %s\n"),
         bHaveRuntimePose ? TEXT("RUNTIME (from device)") : TEXT("HARDCODED (reference values)"));
-    
+
     return Result;
+}
+
+bool USimpleCamera2Test::GetLatestQrFinderDetection(
+    FVector2D& OutBottomLeft,
+    FVector2D& OutTopLeft,
+    FVector2D& OutTopRight,
+    float& OutModuleSize,
+    int32& OutDimensionModules,
+    int64& OutTimestampMs)
+{
+    FScopeLock Lock(&GQrMutex);
+    if (!GQrHasDetection)
+    {
+        OutBottomLeft = FVector2D::ZeroVector;
+        OutTopLeft = FVector2D::ZeroVector;
+        OutTopRight = FVector2D::ZeroVector;
+        OutModuleSize = 0.0f;
+        OutDimensionModules = 0;
+        OutTimestampMs = 0;
+        return false;
+    }
+
+    OutBottomLeft = GQrBottomLeft;
+    OutTopLeft = GQrTopLeft;
+    OutTopRight = GQrTopRight;
+    OutModuleSize = GQrModuleSize;
+    OutDimensionModules = GQrDimension;
+    OutTimestampMs = GQrTimestampMs;
+    return true;
 }
