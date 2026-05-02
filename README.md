@@ -114,6 +114,8 @@ the `FQuest3CameraCalibration` struct contains:
 
 ## quest 3 camera specifications
 
+> **About these values**: The Quest 3 numbers below are **approximate, device-specific reference values** derived from device dumps, intended as a fallback when runtime calibration data is unavailable. They are **not guaranteed** to match every Quest 3 unit, and they may change with future Horizon OS updates or different supported stream resolutions. Where possible, prefer values queried at runtime via `CameraCharacteristics` / the `GetCamera*` Blueprint APIs and treat the hardcoded values as a fallback only.
+
 ### hardware
 - **left camera**: ID 50
 - **right camera**: ID 51
@@ -188,6 +190,27 @@ the plugin automatically adds:
 - `android.permission.CAMERA`
 - `horizonos.permission.HEADSET_CAMERA` (Meta Quest)
 - `horizonos.permission.AVATAR_CAMERA` (Meta Quest)
+
+> **Note for Quest-only deployments**: `horizonos.permission.HEADSET_CAMERA` is the narrower, Quest-specific permission. If your title is Quest-only, you may consider whether the broader `android.permission.CAMERA` is required for your use case.
+
+---
+
+## privacy and data handling
+
+This plugin processes camera frames **on-device only**. The plugin itself does **not** transmit, upload, or persist camera frames to any remote service.
+
+What integrators must understand:
+- The plugin reads frames via the Android Camera2 API and exposes them to UE as a `Texture2D`.
+- The plugin runs an on-device QR decode (ZXing) on the Y plane and exposes the decoded text and finder pattern coordinates via Blueprint.
+- **Anything you do with the texture or QR text in your own application code (rendering, networking, logging, server upload) is outside the scope of this plugin.**
+- If your application transmits, stores, or sends frames or QR contents off-device, you are responsible for the appropriate disclosures and compliance, including Meta's data-use policies for Quest titles.
+- End users should be informed about camera access in your own privacy/permission UX.
+
+---
+
+## third-party components
+
+This plugin redistributes `zxing-core-3.5.2.jar` (Apache License 2.0). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for full attribution. The bundled jar is **not** relicensed under MIT.
 
 ---
 
