@@ -802,19 +802,23 @@ public class Camera2Helper {
                       " planes=" + planes.length);
                 
                 // Extract Y data (full resolution)
+                // rewind() because processQr may have consumed the same buffer position earlier
                 ByteBuffer yBuffer = yPlane.getBuffer();
+                yBuffer.rewind();
                 int ySize = yBuffer.remaining();
                 byte[] yData = new byte[ySize];
                 yBuffer.get(yData);
-                
+
                 // Extract U data (usually half resolution)
                 ByteBuffer uBuffer = uPlane.getBuffer();
+                uBuffer.rewind();
                 int uSize = uBuffer.remaining();
                 byte[] uData = new byte[uSize];
                 uBuffer.get(uData);
-                
+
                 // Extract V data (usually half resolution)
                 ByteBuffer vBuffer = vPlane.getBuffer();
+                vBuffer.rewind();
                 int vSize = vBuffer.remaining();
                 byte[] vData = new byte[vSize];
                 vBuffer.get(vData);
@@ -854,7 +858,9 @@ public class Camera2Helper {
             if (planes.length > 0) {
                 Image.Plane yPlane = planes[0];
                 ByteBuffer yBuffer = yPlane.getBuffer();
-                
+                // rewind() because processQr may have consumed the same buffer position earlier
+                yBuffer.rewind();
+
                 int imageWidth = image.getWidth();
                 int imageHeight = image.getHeight();
                 
